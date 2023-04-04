@@ -43,6 +43,8 @@ class MaskFormer(nn.Module):
         panoptic_on: bool,
         instance_on: bool,
         test_topk_per_image: int,
+        error_estimation_on: bool,
+        mask_refinement_on: bool,
     ):
         """
         Args:
@@ -92,6 +94,9 @@ class MaskFormer(nn.Module):
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
+
+        self.error_estimation_on = error_estimation_on
+        self.mask_refinement_on = mask_refinement_on
 
     @classmethod
     def from_config(cls, cfg):
@@ -168,6 +173,8 @@ class MaskFormer(nn.Module):
             "instance_on": cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
             "panoptic_on": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
+            "error_estimation_on": cfg.MODEL.MASK_FORMER.ERROR_ESTIMATION_ON,
+            "mask_refinement_on": cfg.MODEL.MASK_FORMER.MASK_REFINEMENT_ON
         }
 
     @property
@@ -227,7 +234,11 @@ class MaskFormer(nn.Module):
             return losses
         else:
             mask_cls_results = outputs["pred_logits"]
-            mask_pred_results = outputs["pred_masks"]
+
+            if self.mask_refinement_on:
+                mask_pred_results = outputs["pred_refined_masks"]
+            else:
+                mask_pred_results = outputs["pred_masks"]
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
