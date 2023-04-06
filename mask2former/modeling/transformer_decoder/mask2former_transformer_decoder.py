@@ -350,48 +350,93 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.norm = norm
 
         if self.error_estimation_on:
-            self.ee_conv_norm_relus = []
-            for k in range(4):
-                conv = Conv2d(
-                    hidden_dim + 1 if k == 0 else hidden_dim,
-                    hidden_dim,
-                    kernel_size=1 if k == 0 else 3,
-                    stride=1,
-                    padding=0 if k == 0 else 1,
-                    bias=not self.norm,
-                    norm=get_norm(self.norm, hidden_dim),
-                    activation=F.relu,
+            initial_channel = 0
+            if "feat" in self.error_estimation_in_features:
+                initial_channel += hidden_dim
+            if "pred" in self.error_estimation_in_features:
+                initial_channel += num_queries
+
+            self.ee_norm = nn.LayerNorm(hidden_dim)
+            self.ee_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+
+            # [Q, B, C] + [Q, B, C] -> [Q, B, C]
+            self.ee_output_mask_embed_fusion_layer = nn.Sequential(
+                nn.Linear(2*hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+            )
+
+            self.ee_transformer_self_attention_layer = \
+                SelfAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
                 )
-                self.add_module(f"ee_conv_norm_relu_{k}", conv)
-                self.ee_conv_norm_relus.append(conv)
-            self.ee_predictor = Conv2d(hidden_dim, 1, kernel_size=1, stride=1, padding=0)
-            for layer in self.ee_conv_norm_relus:
-                weight_init.c2_msra_fill(layer)
-            nn.init.normal_(self.ee_predictor.weight, std=0.001)
-            if self.ee_predictor.bias is not None:
-                nn.init.constant_(self.ee_predictor.bias, 0)
+            self.ee_transformer_cross_attention_layer = \
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            
+            self.ee_transformer_ffn_layer = \
+                FFNLayer(
+                    d_model=hidden_dim,
+                    dim_feedforward=dim_feedforward,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
 
         if self.mask_refinement_on:
-            self.mr_conv_norm_relus = []
-            for k in range(4):
-                conv = Conv2d(
-                    2*hidden_dim + 1 if k == 0 else hidden_dim,
-                    hidden_dim,
-                    kernel_size=1 if k == 0 else 3,
-                    stride=1,
-                    padding=0 if k == 0 else 1,
-                    bias=not self.norm,
-                    norm=get_norm(self.norm, hidden_dim),
-                    activation=F.relu,
+            self.mask_refinement_layers = nn.ModuleList()
+            initial_channel = 0
+            if "feat" in self.mask_refinement_in_features:
+                initial_channel += hidden_dim
+            if "pred" in self.mask_refinement_in_features:
+                initial_channel += num_queries
+
+            self.mr_output_mask_embed_fusion_layer = nn.Sequential(
+                nn.Linear(2*hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+            )
+
+            self.mr_transformer_self_attention_layer = \
+                SelfAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
                 )
-                self.add_module(f"mr_conv_norm_relu_{k}", conv)
-                self.mr_conv_norm_relus.append(conv)
-            self.mr_predictor = Conv2d(hidden_dim, 1, kernel_size=1, stride=1, padding=0)
-            for layer in self.mr_conv_norm_relus:
-                weight_init.c2_msra_fill(layer)
-            nn.init.normal_(self.mr_predictor.weight, std=0.001)
-            if self.mr_predictor.bias is not None:
-                nn.init.constant_(self.mr_predictor.bias, 0)
+            
+            self.mr_transformer_cross_attention_layer = \
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            
+            self.mr_transformer_ffn_layer = \
+                FFNLayer(
+                    d_model=hidden_dim,
+                    dim_feedforward=dim_feedforward,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            
 
 
     @classmethod
@@ -508,46 +553,74 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             # NOTE: we use the last layer of transformer to estimate error
 
 
-            # src[level_index] (feature from pixel decoder): hw, B, C
+            # output (features from previous transformer): QxBxC
+            # mask_embed (learnable mask embedding): B, Q, C
             # predictions_mask[-1] (mask predictions): B, Q, H, W -> downsample to B, Q, h, w -> Q,B,hw or hw,B,Q
+            # src[level_index] (feature from previous transformer): hw, B, C
 
             # optional
             # outputs_class (class predictions): BxQxC
             # mask_features (pixel-embedding): NxCxHxW
 
+
             # [output] -> QxBxC
             # [src[level_index] + predictions_mask[-1]] -> hw, B, C
-            pred_masks = predictions_mask[-1] # B, Q, H, W
-            # B, Q, H, W -> B, Q, h, w
-            pred_masks_downsampled = F.interpolate(pred_masks, size=(pred_masks.shape[-2] // 4, pred_masks.shape[-1] // 4), mode='bilinear', align_corners=False)
-            # B, Q, h, w -> BQ, 1, h, w
-            pred_masks_downsampled = pred_masks_downsampled.view(-1, 1, pred_masks_downsampled.shape[-2], pred_masks_downsampled.shape[-1]) 
-            # hw, B, C -> B, C, hw -> B, C, H, W -> BQ, C, H, W
-            pixel_features = src[level_index]
-            pixel_features = pixel_features.permute(1, 2, 0)
-            pixel_features = pixel_features.view(pixel_features.shape[0], pixel_features.shape[1], pred_masks_downsampled.shape[-2] * 2, pred_masks_downsampled.shape[-1] * 2)
-            pixel_features = F.interpolate(pixel_features, size=(pred_masks_downsampled.shape[-2], pred_masks_downsampled.shape[-1]), mode='bilinear', align_corners=False)
-            pixel_features = pixel_features.repeat(pred_masks.shape[1], 1, 1, 1)
-            ee_features = torch.cat([pixel_features, pred_masks_downsampled.sigmoid()], dim=1) # BQ, C+1, H, W
+            mask_embed = mask_embed.permute(1, 0, 2) # BxQxC -> QxBxC
 
-            # run for each batch
-            for layer in self.ee_conv_norm_relus:
-                ee_features = layer(ee_features) # BQ, C, H, W
-            pred_mask_errors = self.ee_predictor(ee_features) # BQ, 1, H, W
-            pred_mask_errors = pred_mask_errors.view(pred_masks.shape[0], pred_masks.shape[1], pred_mask_errors.shape[-2], pred_mask_errors.shape[-1]) # B, Q, H, W
-            out['pred_mask_errors'] = pred_mask_errors
+            output = torch.cat([output, mask_embed], dim=-1) # QxBxC + QxBxC -> QxBx2C
+            output = self.ee_output_mask_embed_fusion_layer(output) # QxBx2C -> QxBxC
+
+            level_index = self.num_feature_levels - 1 # Among 1/32, 1/16, 1/8, we use only the last resolution
+            attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False # attn_mask: B, Q, hxw
+
+            # pred_masks_downsampled = self.ee_downsample_layer(predictions_mask[-1]) # B, Q, H, W -> B, Q, h, w
+            output = self.ee_transformer_cross_attention_layer(
+                output, src[level_index],
+                memory_mask=attn_mask,
+                memory_key_padding_mask=None,  # here we do not apply masking on padded region
+                pos=pos[level_index], query_pos=query_embed
+            )
+
+            output = self.ee_transformer_self_attention_layer(
+                output, tgt_mask=None,
+                tgt_key_padding_mask=None,
+                query_pos=query_embed
+            )
+            
+            # FFN
+            output = self.ee_transformer_ffn_layer(
+                output
+            )
+
+            outputs_class, pred_error_masks, attn_mask, mask_embed = self.forward_error_estimation_heads(output, mask_features, attn_mask_target_size=size_list[-1])
+            out['pred_mask_errors'] = pred_error_masks
 
         if self.mask_refinement_on:
+            level_index = self.num_feature_levels - 1 # Among 1/32, 1/16, 1/8, we use only the last resolution
+            attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False # attn_mask: B, Q, hxw
 
-            pred_mask_errors_downsampled = F.interpolate(pred_mask_errors,  size=(pred_masks.shape[-2] // 4, pred_masks.shape[-1] // 4), mode='bilinear', align_corners=False)
-            pred_mask_errors_downsampled = pred_mask_errors_downsampled.view(-1, 1, pred_mask_errors_downsampled.shape[-2], pred_mask_errors_downsampled.shape[-1])
-            mr_features = torch.cat([pixel_features, ee_features, pred_mask_errors_downsampled.sigmoid()], dim=1) # BQ, C+1, H, W
+            mask_embed = mask_embed.permute(1, 0, 2) # BxQxC -> QxBxC
+            output = torch.cat([output, mask_embed], dim=-1) # QxBxC + QxBxC -> QxBx2C
+            output = self.mr_output_mask_embed_fusion_layer(output) # QxBx2C -> QxBxC
 
-            # run for each batch
-            for layer in self.mr_conv_norm_relus:
-                mr_features = layer(mr_features)
-            pred_refined_masks = self.mr_predictor(mr_features) # BQ, 1, H, W
-            pred_refined_masks = pred_refined_masks.view(pred_masks.shape[0], pred_masks.shape[1], pred_refined_masks.shape[-2], pred_refined_masks.shape[-1]) # B, Q, H, W
+            output = self.mr_transformer_cross_attention_layer(
+                output, src[level_index],
+                memory_mask=attn_mask,
+                memory_key_padding_mask=None,  # here we do not apply masking on padded region
+                pos=pos[level_index], query_pos=query_embed
+            )
+
+            output = self.mr_transformer_self_attention_layer(
+                output, tgt_mask=None,
+                tgt_key_padding_mask=None,
+                query_pos=query_embed
+            )
+            
+            # FFN
+            output = self.mr_transformer_ffn_layer(
+                output
+            )
+            outputs_class, pred_refined_masks, attn_mask, mask_embed = self.forward_mask_refinement_heads(output, mask_features, attn_mask_target_size=size_list[-1])
             out['pred_refined_masks'] = pred_refined_masks
         return out
 
@@ -569,10 +642,9 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         return outputs_class, outputs_mask, attn_mask, mask_embed
 
     def forward_error_estimation_heads(self, output, mask_features, attn_mask_target_size):
-        decoder_output = self.decoder_norm(output)
+        decoder_output = self.ee_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
-        outputs_class = self.class_embed(decoder_output) # [B, Q, num_class]
-        mask_embed = self.mask_embed(decoder_output) # [B, Q, C]
+        mask_embed = self.ee_embed(decoder_output) # [B, Q, C]
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
         # NOTE: prediction is of higher-resolution
@@ -583,7 +655,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, attn_mask, mask_embed
+        return None, outputs_mask, attn_mask, mask_embed
 
     def forward_mask_refinement_heads(self, output, mask_features, attn_mask_target_size):
         decoder_output = self.decoder_norm(output)
