@@ -109,7 +109,7 @@ class MaskFormer(nn.Module):
         self.mask_refinement_on = mask_refinement_on
         if self.error_estimation_on and self.mask_refinement_on or True:
             self.norm = ""
-            pooler_resolution = 32
+            pooler_resolution = 64
             pooler_scales     = tuple([1.0/8, 1.0/16, 1.0/32])
             sampling_ratio    = 2
             pooler_type       = "ROIAlign"
@@ -185,6 +185,7 @@ class MaskFormer(nn.Module):
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
+            mask_refinement_on=cfg.MODEL.MASK_FORMER.MASK_REFINEMENT_ON,
         )
 
         weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
@@ -284,9 +285,8 @@ class MaskFormer(nn.Module):
 
 
 
-        if self.training or True:
-
-            if self.instance_on:
+        if self.training:
+            if self.mask_refinement_on:
 
                 mask_cls_results = outputs["pred_logits"]
                 mask_pred_results = outputs["pred_masks"] # [B, Q, H, W] [2, 100, 256, 256]
@@ -298,7 +298,6 @@ class MaskFormer(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 )
-
 
                 image_size = mask_pred_results.shape[-2:]
 
@@ -376,7 +375,6 @@ class MaskFormer(nn.Module):
 
 
 
-
             # out['pred_mask_errors'] = F.interpolate(pred_mask_errors, size=(H, W), mode='bilinear', align_corners=False)
 
             # pred_mask_errors = F.interpolate(pred_mask_errors, size=(h, w), mode='bilinear', align_corners=False)
@@ -413,11 +411,53 @@ class MaskFormer(nn.Module):
             return losses
         else:
             mask_cls_results = outputs["pred_logits"]
+            mask_pred_results = outputs["pred_masks"]
 
             if self.mask_refinement_on:
                 mask_pred_results = outputs["pred_refined_masks"]
             else:
-                mask_pred_results = outputs["pred_masks"]
+                 # upsample masks
+                mask_pred_results = F.interpolate(
+                    mask_pred_results,
+                    size=(images.tensor.shape[-2], images.tensor.shape[-1]),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                image_size = mask_pred_results.shape[-2:]
+
+                pred_masks = mask_pred_results  # [B, Q, H, W] [2, 100, 256, 256]
+                pred_masks_bool = pred_masks > 0
+                boxes = []
+                roi_pred_masks = []
+                rois_all = []
+                for batch in range(pred_masks_bool.shape[0]):
+                    boxes.append(BitMasks(pred_masks_bool[batch]).get_bounding_boxes().to(self.device))
+                    inds = torch.arange(pred_masks.shape[1], device=self.device)[:, None]
+                    rois = torch.cat([inds, boxes[batch].tensor], dim=1) # [Q, 5] [100, 5]
+                    rois_all.append(rois[None, :])
+                    roi_pred_masks.append(self.roi_aligner(pred_masks[batch].unsqueeze(1), rois)) # [BQ, 1, h, w] [200, 1, 28, 28]
+                outputs["rois"] = torch.cat(rois_all, dim=0)
+                
+                # multi_scale_features: torch.Size([2, 256, 32, 32]), torch.Size([2, 256, 64, 64]), torch.Size([2, 256, 128, 128])
+                roi_features = self.mask_pooler(multi_scale_features, boxes) # [BQ, C, h, w] [200, 256, 28, 28]
+                roi_pred_masks = torch.cat(roi_pred_masks, dim=0) # [B, Q, H, W]
+
+                # print("roi_pred_masks", roi_pred_masks.shape) # [200, 1, 28, 28]
+                ee_features = torch.cat([roi_features, roi_pred_masks.sigmoid()], dim=1) # [BQ, C+1, h, w] [200, 257, 28, 28]
+                for layer in self.ee_conv_norm_relus:
+                    ee_features = layer(ee_features)
+                pred_mask_errors = self.ee_predictor(ee_features) # [BQ, 1, h, w] [200, 1, 28, 28]
+                outputs['pred_mask_errors'] = pred_mask_errors.view(pred_masks_bool.shape[0], -1, pred_mask_errors.shape[2], pred_mask_errors.shape[3]) # [B, Q, H, W] [2, 100, 256, 256]
+
+                mr_features = torch.cat([roi_features, ee_features, pred_mask_errors.sigmoid()], dim=1) # [BQ, C+1, h, w] [200, 513, 28, 28]
+                for layer in self.mr_conv_norm_relus:
+                    mr_features = layer(mr_features)
+                pred_refined_masks = self.mr_predictor(mr_features) # [BQ, 1, h, w] [200, 1, 28, 28]
+                outputs['pred_refined_masks'] = pred_refined_masks.view(pred_masks_bool.shape[0], -1, pred_refined_masks.shape[2], pred_refined_masks.shape[3]) # [B, Q, H, W] [2, 100, 256, 256]
+
+
+
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,

@@ -75,7 +75,7 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0):
+    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0, mask_refinement_on=False):
         """Creates the matcher
 
         Params:
@@ -91,6 +91,7 @@ class HungarianMatcher(nn.Module):
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
         self.num_points = num_points
+        self.mask_refinement_on = mask_refinement_on
 
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
@@ -109,7 +110,9 @@ class HungarianMatcher(nn.Module):
             # but approximate it in 1 - proba[target class].
             # The 1 is a constant that doesn't change the matching, it can be ommitted.
             cost_class = -out_prob[:, tgt_ids]
-
+            # if self.mask_refinement_on:
+            #     out_mask = outputs["pred_refined_masks"][b]  # [num_queries, H_pred, W_pred]
+            # else:
             out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
             # gt masks are already padded when preparing target
             tgt_mask = targets[b]["masks"].to(out_mask)
