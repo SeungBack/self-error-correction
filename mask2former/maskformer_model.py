@@ -12,6 +12,15 @@ from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
+from detectron2.modeling.poolers import ROIPooler, ROIAlign, convert_boxes_to_pooler_format
+from typing import Callable, Dict, List, Optional, Tuple, Union
+from detectron2.layers import ShapeSpec
+from detectron2.structures import BitMasks
+
+from detectron2.layers import Conv2d
+from detectron2.layers.batch_norm import get_norm
+import fvcore.nn.weight_init as weight_init
+
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
@@ -45,6 +54,7 @@ class MaskFormer(nn.Module):
         test_topk_per_image: int,
         error_estimation_on: bool,
         mask_refinement_on: bool,
+        conv_dim: int,
     ):
         """
         Args:
@@ -97,6 +107,63 @@ class MaskFormer(nn.Module):
 
         self.error_estimation_on = error_estimation_on
         self.mask_refinement_on = mask_refinement_on
+        if self.error_estimation_on and self.mask_refinement_on or True:
+            self.norm = ""
+            pooler_resolution = 32
+            pooler_scales     = tuple([1.0/8, 1.0/16, 1.0/32])
+            sampling_ratio    = 2
+            pooler_type       = "ROIAlign"
+            self.mask_pooler = ROIPooler(
+                output_size=pooler_resolution,
+                scales=pooler_scales,
+                sampling_ratio=sampling_ratio,
+                pooler_type=pooler_type,
+            )
+            self.roi_aligner = ROIAlign((pooler_resolution, pooler_resolution), 1.0, 0, aligned=True)
+
+        if self.error_estimation_on:
+            self.ee_conv_norm_relus = []
+            for k in range(4):
+                conv = Conv2d(
+                    conv_dim + 1 if k == 0 else conv_dim,
+                    conv_dim,
+                    kernel_size=1 if k == 0 else 3,
+                    stride=1,
+                    padding=0 if k == 0 else 1,
+                    bias=not self.norm,
+                    norm=get_norm(self.norm, conv_dim),
+                    activation=F.relu,
+                )
+                self.add_module(f"ee_conv_norm_relu_{k}", conv)
+                self.ee_conv_norm_relus.append(conv)
+            self.ee_predictor = Conv2d(conv_dim, 1, kernel_size=1, stride=1, padding=0)
+            for layer in self.ee_conv_norm_relus:
+                weight_init.c2_msra_fill(layer)
+            nn.init.normal_(self.ee_predictor.weight, std=0.001)
+            if self.ee_predictor.bias is not None:
+                nn.init.constant_(self.ee_predictor.bias, 0)
+
+        if self.mask_refinement_on:
+            self.mr_conv_norm_relus = []
+            for k in range(4):
+                conv = Conv2d(
+                    2*conv_dim + 1 if k == 0 else conv_dim,
+                    conv_dim,
+                    kernel_size=1 if k == 0 else 3,
+                    stride=1,
+                    padding=0 if k == 0 else 1,
+                    bias=not self.norm,
+                    norm=get_norm(self.norm, conv_dim),
+                    activation=F.relu,
+                )
+                self.add_module(f"mr_conv_norm_relu_{k}", conv)
+                self.mr_conv_norm_relus.append(conv)
+            self.mr_predictor = Conv2d(conv_dim, 1, kernel_size=1, stride=1, padding=0)
+            for layer in self.mr_conv_norm_relus:
+                weight_init.c2_msra_fill(layer)
+            nn.init.normal_(self.mr_predictor.weight, std=0.001)
+            if self.mr_predictor.bias is not None:
+                nn.init.constant_(self.mr_predictor.bias, 0)
 
     @classmethod
     def from_config(cls, cfg):
@@ -174,7 +241,8 @@ class MaskFormer(nn.Module):
             "panoptic_on": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
             "error_estimation_on": cfg.MODEL.MASK_FORMER.ERROR_ESTIMATION_ON,
-            "mask_refinement_on": cfg.MODEL.MASK_FORMER.MASK_REFINEMENT_ON
+            "mask_refinement_on": cfg.MODEL.MASK_FORMER.MASK_REFINEMENT_ON,
+            "conv_dim": cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM
         }
 
     @property
@@ -212,9 +280,120 @@ class MaskFormer(nn.Module):
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
-        outputs = self.sem_seg_head(features)
+        outputs, multi_scale_features = self.sem_seg_head(features)
 
-        if self.training:
+
+
+        if self.training or True:
+
+            if self.instance_on:
+
+                mask_cls_results = outputs["pred_logits"]
+                mask_pred_results = outputs["pred_masks"] # [B, Q, H, W] [2, 100, 256, 256]
+                
+                # upsample masks
+                mask_pred_results = F.interpolate(
+                    mask_pred_results,
+                    size=(images.tensor.shape[-2], images.tensor.shape[-1]),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+
+                image_size = mask_pred_results.shape[-2:]
+
+                # [Q, K]
+                # !TODO: support top_k
+                # scores = F.softmax(mask_cls_results, dim=-1)[:, :-1]
+                # labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
+                # scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)
+                # # labels_per_image = labels[topk_indices]
+
+                # topk_indices = topk_indices // self.sem_seg_head.num_classes
+                # mask_pred = mask_pred.unsqueeze(1).repeat(1, self.sem_seg_head.num_classes, 1).flatten(0, 1)
+                # mask_pred = mask_pred_results[topk_indices] # [Q, H, W]
+                
+
+                #!TODO: support panoptic segmentation
+                # if this is panoptic segmentation, we only keep the "thing" classes
+                # if self.panoptic_on:
+                #     keep = torch.zeros_like(scores_per_image).bool()
+                #     for i, lab in enumerate(labels_per_image):
+                #         keep[i] = lab in self.metadata.thing_dataset_id_to_contiguous_id.values()
+
+                #     scores_per_image = scores_per_image[keep]
+                #     labels_per_image = labels_per_image[keep]
+                #     mask_pred = mask_pred[keep]
+                pred_masks = mask_pred_results  # [B, Q, H, W] [2, 100, 256, 256]
+                pred_masks_bool = pred_masks > 0
+                boxes = []
+                roi_pred_masks = []
+                rois_all = []
+                for batch in range(pred_masks_bool.shape[0]):
+                    boxes.append(BitMasks(pred_masks_bool[batch]).get_bounding_boxes().to(self.device))
+                    inds = torch.arange(pred_masks.shape[1], device=self.device)[:, None]
+                    rois = torch.cat([inds, boxes[batch].tensor], dim=1) # [Q, 5] [100, 5]
+                    rois_all.append(rois[None, :])
+                    roi_pred_masks.append(self.roi_aligner(pred_masks[batch].unsqueeze(1), rois)) # [BQ, 1, h, w] [200, 1, 28, 28]
+                outputs["rois"] = torch.cat(rois_all, dim=0)
+                
+                # multi_scale_features: torch.Size([2, 256, 32, 32]), torch.Size([2, 256, 64, 64]), torch.Size([2, 256, 128, 128])
+                roi_features = self.mask_pooler(multi_scale_features, boxes) # [BQ, C, h, w] [200, 256, 28, 28]
+                roi_pred_masks = torch.cat(roi_pred_masks, dim=0) # [B, Q, H, W]
+                
+                # roi_pred_masks = roi_pred_masks.transpose(1, 0) 
+                # for idx, roi_pred_mask in enumerate(roi_pred_masks[0]):
+                #     # save as image
+                #     import numpy as np
+                #     import cv2
+                #     roi_pred_mask = roi_pred_mask.detach().cpu().numpy()
+                #     roi_pred_mask = (roi_pred_mask > 0).astype(np.uint8) * 255
+                #     cv2.imwrite("vis/roi_pred_mask_{}.png".format(idx), roi_pred_mask)
+                # for idx, pred_mask in enumerate(pred_masks[0]):
+                #     # save as image
+                #     import numpy as np
+                #     import cv2
+                #     _, x1, y1, x2, y2 = convert_boxes_to_pooler_format([boxes[batch]])[idx]
+                #     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                #     pred_mask = pred_mask.detach().cpu().numpy()
+                #     pred_mask = (pred_mask > 0).astype(np.uint8) * 255
+                #     cv2.imwrite("vis/pred_mask_{}.png".format(idx), pred_mask)
+                # roi_pred_masks = roi_pred_masks.transpose(1, 0) 
+
+                # print("roi_pred_masks", roi_pred_masks.shape) # [200, 1, 28, 28]
+                ee_features = torch.cat([roi_features, roi_pred_masks.sigmoid()], dim=1) # [BQ, C+1, h, w] [200, 257, 28, 28]
+                for layer in self.ee_conv_norm_relus:
+                    ee_features = layer(ee_features)
+                pred_mask_errors = self.ee_predictor(ee_features) # [BQ, 1, h, w] [200, 1, 28, 28]
+                outputs['pred_mask_errors'] = pred_mask_errors.view(pred_masks_bool.shape[0], -1, pred_mask_errors.shape[2], pred_mask_errors.shape[3]) # [B, Q, H, W] [2, 100, 256, 256]
+
+                mr_features = torch.cat([roi_features, ee_features, pred_mask_errors.sigmoid()], dim=1) # [BQ, C+1, h, w] [200, 513, 28, 28]
+                for layer in self.mr_conv_norm_relus:
+                    mr_features = layer(mr_features)
+                pred_refined_masks = self.mr_predictor(mr_features) # [BQ, 1, h, w] [200, 1, 28, 28]
+                outputs['pred_refined_masks'] = pred_refined_masks.view(pred_masks_bool.shape[0], -1, pred_refined_masks.shape[2], pred_refined_masks.shape[3]) # [B, Q, H, W] [2, 100, 256, 256]
+
+
+
+
+
+            # out['pred_mask_errors'] = F.interpolate(pred_mask_errors, size=(H, W), mode='bilinear', align_corners=False)
+
+            # pred_mask_errors = F.interpolate(pred_mask_errors, size=(h, w), mode='bilinear', align_corners=False)
+            # pred_mask_errors = pred_mask_errors.view(-1, 1, h, w) # BQ, 1, h, w
+
+            # mr_features_i = torch.cat([pixel_features.repeat(Q//num_runs, 1, 1, 1), ee_features, pred_mask_errors.sigmoid()], dim=1) # BQ, C+1, H, W
+            # for layer in self.mr_conv_norm_relus:
+            #     mr_features_i = layer(mr_features_i)
+            # pred_refined_masks = self.mr_predictor(mr_features_i)
+            
+            
+            # # pred_mask_errors = torch.cat(pred_mask_errors_i, dim=0)
+
+            # # pred_refined_masks = torch.cat(pred_refined_masks_i, dim=0)
+            # # pred_refined_masks = pred_refined_masks.view(B, Q, h, w) # B, Q, H, W
+
+
             # mask classification target
             if "instances" in batched_inputs[0]:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]

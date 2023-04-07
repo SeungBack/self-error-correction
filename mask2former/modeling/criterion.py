@@ -14,6 +14,7 @@ from detectron2.projects.point_rend.point_features import (
     get_uncertain_point_coords_with_randomness,
     point_sample,
 )
+from detectron2.modeling.poolers import ROIAlign
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 
@@ -200,6 +201,8 @@ class SetCriterion(nn.Module):
         src_masks = outputs["pred_refined_masks"]
         src_masks = src_masks[src_idx]
         masks = [t["masks"] for t in targets]
+        rois = outputs["rois"] # B, Q, 5
+        rois = rois[src_idx][:, 1:] # T, 4
         # TODO use valid to mask invalid areas due to padding in loss
         target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
         target_masks = target_masks.to(src_masks)
@@ -210,31 +213,51 @@ class SetCriterion(nn.Module):
         src_masks = src_masks[:, None]
         target_masks = target_masks[:, None]
 
-        with torch.no_grad():
-            # sample point_coords
-            point_coords = get_uncertain_point_coords_with_randomness(
-                src_masks,
-                lambda logits: calculate_uncertainty(logits),
-                self.num_points,
-                self.oversample_ratio,
-                self.importance_sample_ratio,
-            )
-            # get gt labels
-            point_labels = point_sample(
-                target_masks,
-                point_coords,
-                align_corners=False,
-            ).squeeze(1)
+        # crop target_masks by rois using RoIAlign
+        inds = torch.arange(target_masks.shape[0], device=target_masks.device)[:, None]
+        rois = torch.cat((inds, rois), dim=1)
+        target_masks = ROIAlign(src_masks.shape[-2:], 1.0, 0, True).forward(target_masks, rois)
+        target_masks = (target_masks > 0.5).float() # 0 ~ 1
 
-        point_logits = point_sample(
-            src_masks,
-            point_coords,
-            align_corners=False,
-        ).squeeze(1)
+        # # visualize refine masks
+        # import numpy as np
+        # import cv2
+        # for i in range(src_masks.shape[0]):
+        #     gt_mask = target_masks[i, 0, :, :].detach().cpu().numpy()
+        #     gt_mask = np.uint8(gt_mask * 255)
+        #     refine_mask = src_masks[i, 0, :, :].detach().cpu().numpy() > 0
+        #     refine_mask = np.uint8(refine_mask * 255)
+        #     vis_img = np.hstack((gt_mask, refine_mask))
+        #     cv2.imwrite('refined_mask_{}.png'.format(i), vis_img)
+        #     break
 
+
+        # with torch.no_grad():
+        #     # sample point_coords
+        #     point_coords = get_uncertain_point_coords_with_randomness(
+        #         src_masks,
+        #         lambda logits: calculate_uncertainty(logits),
+        #         self.num_points,
+        #         self.oversample_ratio,
+        #         self.importance_sample_ratio,
+        #     )
+        #     # get gt labels
+        #     point_labels = point_sample(
+        #         target_masks,
+        #         point_coords,
+        #         align_corners=False,
+        #     ).squeeze(1)
+
+        # point_logits = point_sample(
+        #     src_masks,
+        #     point_coords,
+        #     align_corners=False,
+        # ).squeeze(1)
+
+        N, C, H, W = src_masks.shape
         losses = {
-            "loss_refined_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
-            "loss_refined_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+            "loss_error_mask": sigmoid_ce_loss_jit(src_masks, target_masks, N*H*W),
+            "loss_error_dice": dice_loss_jit(src_masks, target_masks.flatten(1), N),
         }
 
         del src_masks
@@ -254,6 +277,8 @@ class SetCriterion(nn.Module):
         src_masks = src_masks[src_idx]
         initial_masks = outputs['pred_masks']
         initial_masks = initial_masks[src_idx]
+        rois = outputs["rois"] # B, Q, 5
+        rois = rois[src_idx][:, 1:] # T, 4
         masks = [t["masks"] for t in targets]
         # TODO use valid to mask invalid areas due to padding in loss
         target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
@@ -268,46 +293,56 @@ class SetCriterion(nn.Module):
         target_masks = target_masks[:, None] # 0 ~ 1
 
         initial_masks_bool = initial_masks > 0 # 0 ~ 1
-        target_masks = (initial_masks_bool != target_masks).float() # 0 ~ 1
+        target_masks = (initial_masks_bool != target_masks).float() # 0 ~ 1 # [N, 1, H, W]
+
+        # crop target_masks by rois using RoIAlign
+        inds = torch.arange(target_masks.shape[0], device=target_masks.device)[:, None]
+        rois = torch.cat((inds, rois), dim=1)
+        target_masks = ROIAlign(src_masks.shape[-2:], 1.0, 0, True).forward(target_masks, rois)
+        target_masks = (target_masks > 0.5).float() # 0 ~ 1
+
 
         # # visualize error masks
+        # initial_masks = ROIAlign(src_masks.shape[-2:], 1.0, 0, True).forward(initial_masks, rois)
         # import numpy as np
         # import cv2
-        # for i in range(error_masks.shape[0]):
-        #     initial_mask = initial_masks_bool[i, 0, :, :].detach().cpu().numpy()
+        # for i in range(src_masks.shape[0]):
+        #     initial_mask = initial_masks[i, 0, :, :].detach().cpu().numpy() > 0
         #     initial_mask = np.uint8(initial_mask * 255)
         #     gt_mask = target_masks[i, 0, :, :].detach().cpu().numpy()
         #     gt_mask = np.uint8(gt_mask * 255)
-        #     error_mask = error_masks[i, 0, :, :].cpu().numpy()
+        #     error_mask = src_masks[i, 0, :, :].detach().cpu().numpy() > 0
         #     error_mask = np.uint8(error_mask * 255)
         #     vis_img = np.hstack((initial_mask, gt_mask, error_mask))
         #     cv2.imwrite('error_mask_{}.png'.format(i), vis_img)
+        #     break
 
 
-        with torch.no_grad():
-            # sample point_coords
-            point_coords = get_uncertain_point_coords_with_randomness(
-                src_masks,
-                lambda logits: calculate_uncertainty(logits),
-                self.num_points,
-                self.oversample_ratio,
-                self.importance_sample_ratio,
-            )
-            # get gt labels
-            point_labels = point_sample(
-                target_masks,
-                point_coords,
-                align_corners=False,
-            ).squeeze(1)
+        # with torch.no_grad():
+        #     # sample point_coords
+        #     point_coords = get_uncertain_point_coords_with_randomness(
+        #         src_masks,
+        #         lambda logits: calculate_uncertainty(logits),
+        #         self.num_points,
+        #         self.oversample_ratio,
+        #         self.importance_sample_ratio,
+        #     )
+        #     # get gt labels
+        #     point_labels = point_sample(
+        #         target_masks,
+        #         point_coords,
+        #         align_corners=False,
+        #     ).squeeze(1)
 
-        point_logits = point_sample(
-            src_masks,
-            point_coords,
-            align_corners=False,
-        ).squeeze(1)
+        # point_logits = point_sample(
+        #     src_masks,
+        #     point_coords,
+        #     align_corners=False,
+        # ).squeeze(1)
+        N, C, H, W = src_masks.shape
         losses = {
-            "loss_error_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
-            "loss_error_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+            "loss_error_mask": sigmoid_ce_loss_jit(src_masks, target_masks, N*H*W),
+            "loss_error_dice": dice_loss_jit(src_masks, target_masks.flatten(1), N)
         }
 
         del src_masks
